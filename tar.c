@@ -73,6 +73,7 @@ enum {
 	LF_DIR =	'5',
 	LF_FIFO =	'6',
 	LF_CONTIG =	'7',
+	LF_XHEADER = 'x',
 
 	/* 'A' - 'Z' are reserved for custom implementations */
 
@@ -1211,36 +1212,109 @@ skip(int ar, Hdr *hp, char *fname)
 	}
 }
 
+static void
+getpaxpath(char *s, char *path, char *fname) {
+	long n, len;
+	char *p, *k, *v;
+	
+	/* in case there is no path record */
+	*path = '\0';
+
+	while (*s) {
+		len = strlen(s);
+
+		/* first space marks length number */
+		p = strchr(s, ' ');
+		if (p == nil) {
+			fprint(2, "%s: pax record missing length: %s\n",
+			argv0, fname);
+			return;
+		}
+		*p++ = '\0';
+
+		n = strtoul(s, nil,10);
+		if (n < 5 || len < n) {
+			fprint(2, "%s: pax record has invalid length: %s\n",
+			argv0, fname);
+			return;
+		}
+
+		/* new line seperates each record */
+		if (s[n - 1] != '\n') {
+			fprint(2, "%s: pax record missing \\n: %s\n",
+			argv0, fname);
+			return;
+		}
+		s[n-1] = '\0';
+
+		/* equal sign seperates key and value pair */
+		v = strchr(p, '='); 
+		if (v == nil) {
+			fprint(2, "%s: pax record missing =: %s\n",
+			argv0, fname);
+			return;
+		}
+		*v++ = '\0';
+		k = p;
+		
+		/* only care about path */
+		if (strcmp(k, "path") == 0) {
+			path[Maxlongname] = '\0';
+			strncpy(path, v, Maxlongname);
+			break;
+		}
+		s += n;
+	}
+}
+
+static void
+artobuf(int ar, Hdr *hp, char *fname, char *buf, int max)
+{
+	ulong blksleft, blksread;
+	char *p;
+	int n;
+
+	p = buf;
+	for (blksleft = BYTES2TBLKS(arsize(hp)); blksleft > 0;
+		 blksleft -= blksread) {
+		hp = getblkrd(ar, Alldata);
+		if (hp == nil)
+			sysfatal("unexpected EOF on archive reading %s from %s",
+				fname, arname);
+		blksread = gothowmany(blksleft);
+		n = &buf[max] - p;
+		if(Tblock*blksread < n)
+			n = Tblock*blksread;
+		memmove(p, hp->data, n);
+		p += n;
+		putreadblks(ar, blksread);
+	}
+	*p = '\0';
+}
+
 static char*
 getname(int ar, Hdr *hp)
 {
 	static char namebuf[Maxlongname+1], *nextname = nil;
-	ulong blksleft, blksread;
-	char *fname, *p;
-	int n;
+	char *fname, *xrecords;
+	Off bytes;
 
-	if(nextname != nil && nextname[0] != '\0'){
+	if (nextname != nil && nextname[0] != '\0') {
 		fname = nextname, nextname = nil;
 		return fname;
 	}
 	fname = name(hp);
-	if(hp->linkflag == LF_LONGNAME){
-		p = namebuf;
-		for (blksleft = BYTES2TBLKS(arsize(hp)); blksleft > 0;
-		     blksleft -= blksread) {
-			hp = getblkrd(ar, Alldata);
-			if (hp == nil)
-				sysfatal("unexpected EOF on archive reading %s from %s",
-					fname, arname);
-			blksread = gothowmany(blksleft);
-			n = &namebuf[Maxlongname] - p;
-			if(Tblock*blksread < n)
-				n = Tblock*blksread;
-			memmove(p, hp->data, n);
-			p += n;
-			putreadblks(ar, blksread);
-		}
-		*p = '\0';
+	if (hp->linkflag == LF_LONGNAME) {
+		artobuf(ar, hp, fname, namebuf, Maxlongname);
+		fname = nil;
+		nextname = namebuf;
+	} else if (hp->linkflag == LF_XHEADER) {
+		bytes = arsize(hp);
+		xrecords = malloc(bytes+1);
+		assert(xrecords != nil);
+		artobuf(ar, hp, fname, xrecords, bytes);
+		getpaxpath(xrecords, namebuf, fname);
+		free(xrecords);
 		fname = nil;
 		nextname = namebuf;
 	} else {
